@@ -20,3 +20,7 @@ See `__name__ == '__main__':` for how the code runs, there are two steps:
 You can have a look at the sample database dumps (file ending "`.sqlite`") by uploading the file to [http://sqliteviewer.flowsoft7.com/](http://sqliteviewer.flowsoft7.com/). 
 
 You can also reconstruct the SQLite database by renaming one of the `.json` files to `CCI.json`, then the Python script will add the JSON data to the `CCI.sqlite` database.
+
+Example of searching database for entries limited by only date in `aerosol` and `fire` data (not complete folder crawls!)
+
+![screenshot of SQLite database search](scshot-151222.png)
