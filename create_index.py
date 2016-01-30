@@ -1,6 +1,7 @@
 #
 # create_index.py
 # First ver: 10/12/2015
+#            30/01/2016: Added exam_size, exam_cdf
 # MB Eide -- TechForSpace
 #
 # Connects to ESA Climate Change Initiative public data FTP server
@@ -11,10 +12,13 @@
 # that can be easily searched and accessed
 #
 
-import os.path
+import os, os.path
 import json
 import sqlite3
 import re
+import pycurl
+from netCDF4 import Dataset
+import urllib
 
 CCI_LS_PATH = 'CCI.json'
 CCI_DB_PATH = 'CCI.sqlite'
@@ -170,7 +174,7 @@ def find_info(list_of_files, sqlite_db_connection, experiment_list=None,
     date    = re.compile("((19|20)(\d{2}))(0[1-9]|1[012])(0[1-9]|[12][0-9]|3[01])((\d{2})(\d{2})(\d{2}))?")
 
     for f in list_of_files:
-        print 'hei', f
+        print 'Found file', f
         # check each entry, categorising it and saving it to database
         f_exp = ''  # Dataset
         f_prd = ''  # Product
@@ -229,7 +233,17 @@ def find_info(list_of_files, sqlite_db_connection, experiment_list=None,
             f_dte   = '{0}-{1}-{2} {3}:{4}:{5}'.format(
                     dte_yr, dte_mn, dte_dy, dte_hr, dte_mi, dte_sc )
 
-            entries_to_add.append((f_exp, f_prd, f_lvl, f_sns, f_rte, f_dte, f_pth))
+            f_siz   = exam_size(f_path)
+
+            entries_to_add.append((
+                f_exp, 
+                f_prd, 
+                f_lvl, 
+                f_sns, 
+                f_rte, 
+                f_dte, 
+                f_siz,
+                f_pth))
 
         else :
             # Something is not right
@@ -269,6 +283,95 @@ def connect_sqlite_db(sqlite_db_file):
 
     return conn
 
+def exam_size(filein):
+    """ Exams size of NetCDF file.
+        Input: FTP address (string)
+        Returns FILESIZE in bytes """
+
+    c = pycurl.Curl()
+    c.setopt(c.URL, filein)
+    c.setopt(c.HEADER, 1)
+    c.setopt(c.NOBODY, 1)
+    c.perform()
+    filesize = c.getinfo(c.CONTENT_LENGTH_DOWNLOAD)
+
+    return filesize
+
+def exam_cdf(filein, dllist=None, errorlog=None):
+    """ Opens and exams NetCDF file. 
+        Input:  filein: ftp address of file
+                dllist: dictionary of downloaded ftp files and location,
+                        where each key is a ftp address
+        Returns header values:
+            - Geospatial latitude:  max, min(, resolution)
+            - Geospatial longitude: max, min(, resolution)
+            - (Geospatial resolution if not already found for lat/long)
+            - Geospatial: max, min
+            - ...
+    """
+
+    # Check if file has been downloaded
+    file_downloaded = False
+    if dllist :
+        if filein in dllist.keys():
+            file_downloaded = True
+            dlfile = dllist[filein]
+
+    if not file_downloaded :
+        # Download file to a temp D/L directory 
+        pid = os.getpid()
+        dlfolder0 = 'temp_dl/'
+        dlfolder1 = 'temp_dl/' + str(pid) + '/'
+        dlfile   = dlfolder1 + filein.split('/')[-1]
+        if not os.path.isdir(dlfolder0):
+            os.mkdir(dlfolder0)
+            os.mkdir(dlfolder1)
+        else :
+            if not os.path.isdir(dlfolder1):
+                os.mkdir(dlfolder1)
+
+        print 'Downloading', filein
+        print exam_size(filein)/1024/1024, 'mb to download'
+        with open(dlfile, 'wb') as d:
+            c = pycurl.Curl()
+            c.setopt(c.URL, filein)
+            c.setopt(c.WRITEDATA, d)
+            c.perform()
+        print 'Download of', filein, 'completed'
+
+        # Check if the file was downloaded
+        if not (os.path.isfile(dlfile) and os.path.getsize(dlfile) > 0) :
+            raise IOError('Downloaded file {} does not exist/is empty!' \
+                    .format(dlfile))
+
+        if dllist :
+            # Append downloaded file to dictionary
+            dllist[filein] = os.path.abspath(dlfile)
+
+
+    # Investigate file
+    df = Dataset(dlfile, 'r')
+
+    outs = dict()
+
+    # Lat/longs
+    args = ['geospatial_lat_min', 'geospatial_lat_max', 
+            'geospatial_lon_min', 'geospatial_lat_max', 
+            'geospatial_vertical_min', 'geospatial_vertical_max', 
+            'geospatial_lat_units',
+            'geospatial_lat_resolution', 'geospatial_lon_resolution', 
+            'spatial_resolution', 'time_coverage_resolution', 
+            'sensor', 'platform', 'keywords']
+    for a in args:
+        try :
+            outs[a] = getattr(df, a)
+        except AttributeError :
+            outs[a] = ''
+
+
+    return outs
+
+
 
 def test_functions():
     """ Test functions """
@@ -288,6 +391,7 @@ def test_functions():
         find_info(cci_db['11']['all_files'], sq_c)
     else :
         find_info(["aerosol/data/AATSR_SU/L3_DAILY/v4.2/2002/11/20021126-ESACCI-L3C_AEROSOL-ALL-AATSR_ENVISAT-SU_DAILY-v4.2.nc", "/neodc/esacci/aerosol/data/AATSR_SU/L3_DAILY/v4.2/2002/11/20021126-ESACCI-L3C_AEROSOL-ALL-AATSR_ENVISAT-SU_DAILY-v4.2.nc"], sq_c)
+
 
     
 
