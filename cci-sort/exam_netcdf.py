@@ -7,6 +7,7 @@
 
 import os, os.path
 from netCDF4 import Dataset
+import pycurl
 
 def exam_size(filein):
     """ Exams size of NetCDF file.
