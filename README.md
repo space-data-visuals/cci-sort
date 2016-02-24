@@ -1,26 +1,48 @@
 # cci-sort
 Methods for accessing CCI data
 
-## create_index.py
-See `__name__ == '__main__':` for how the code runs, there are two steps:
 
-1. Check if data dictionary already exists
-    - If saved list of NC files exist in a Python dictionary where the *key is the name of the dataset*, it loads it to the memory
-    - If it does not exist, the program will connect to the CCI FTP server and search it (based on parameters in the beginning of file) to find NC files in the subfolders
-        - The results will be saved to a new JSON file: `CCI.json`.
-        - The results are a list of filenames found for that folder
-        - The JSON file is a dictionary with one key: **the folder name of the root folder chosen to iterate from** with the file list as value
-2. Categorises the long list of file name strings (from the `CCI.json` file)
-    - Creates or connects to an SQLite database with filename defined in `CCI_DB_PATH`
-    - Checks for parameters in the function `find_info(list of strings, SQLite database connection)`
-        - Determines level, instrument, etc, based on Rémi's table
-    - Saves the categorised data to the SQLite database
-    - NB! It saves but does not check for duplicates yet
+## README
 
-You can have a look at the sample database dumps (file ending "`.sqlite`") by uploading the file to [http://sqliteviewer.flowsoft7.com/](http://sqliteviewer.flowsoft7.com/). 
+- See run.py for basic usage
+- Note that it is expecting a CCI-API server to be running as configured in config.py
 
-You can also reconstruct the SQLite database by renaming one of the `.json` files to `CCI.json`, then the Python script will add the JSON data to the `CCI.sqlite` database.
+## File structures:
 
-Example of searching database for entries limited by only date in `aerosol` and `fire` data (not complete folder crawls!)
+### connect_to_api.py
 
-![screenshot of SQLite database search](scshot-151222.png)
+ class Upload
+   - Connects to the CCI-API and gets IDs for experiment names
+     and uploads files for that experiment ID.
+   - Note especially post_files()
+     where the files of Experiment are attempted transferred to the
+     server, but the server can't accept all the fields for each file yet.
+
+
+### find_files.py
+
+ class Experiment
+   - For an experiment, holding associated files stored as
+     Child_file objects in a list, Experiment.files
+
+ class Child_file
+   - Each file found on the server becomes a Child_file object
+     where the properties are stored as a dictionary
+     in Child_file.properties
+
+ class Explore
+   - Function that accesses the CCI FTP server and enumerates it from a
+     given folder, see CCI_FTP and CCI_HOME in config.py
+
+
+### exam_netcdf.py
+
+ function exam_size
+   - Downloads header from FTP to get NetCDF file size in bytes 
+ function exam_cdf
+   - Downloads full NetCDF file to read out header values
+     such as latitudes, resolution, level, instruments and platform
+
+
+
+

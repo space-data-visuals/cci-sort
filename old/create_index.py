@@ -2,6 +2,7 @@
 # create_index.py
 # First ver: 10/12/2015
 #            30/01/2016: Added exam_size, exam_cdf
+#            24/02/2016: Checks netCDF file, integrates with CCI-API
 # MB Eide -- TechForSpace
 #
 # Connects to ESA Climate Change Initiative public data FTP server
@@ -14,182 +15,197 @@
 
 import os, os.path
 import json
-import sqlite3
 import re
-import pycurl
-from netCDF4 import Dataset
-import urllib
+import ftputil
+import requests
+import cPickle as pickle
+from numpy import where
 
-CCI_LS_PATH = 'CCI.json'
-CCI_DB_PATH = 'CCI.sqlite'
-CCI_USER    = 'anonymous'
-CCI_PASS    = 'guest'
-CCI_FTP     = 'anon-ftp.ceda.ac.uk'
-#CCI_HOME    = '/neodc/esacci/'
-#CCI_HOME    = '/neodc/esacci/aerosol/data/AATSR_SU/L3_DAILY/v4.2/2002/'
-CCI_HOME    = '/neodc/esacci/fire/data/burned_area/grid/v3.1/2006/'
-CCI_DTYPE   = 'nc'
-CCI_DB_NAME = 'cci_db'
+from exam_netcdf import exam_size, exam_cdf
 
-def find_all_datafiles(host, ftype):
-    """ Iterates every underlying directory until it finds data.
-        Returns:
-            - Full path to data file,
-            - Instrument/product
-            - Sampling rate (DAILY, 8DAY, MONTHLY, ANNUALLY)
-            - Level
-            - Date
-        FIRST TRY: ASSUME ALL THIS CAN BE RECOVERED FROM FILENAME """
+from config import *
 
-    dir_level = 0               # Root level, exits when returning 
-    has_visited = []            # list of folders that are visited
-    has_visited_all = False     # when dir_level = 0, we are done
-    cntr = 0                    # counting how many levels we've visited
-    files = []                  # list of data files found
-
-    while not has_visited_all :
-        # Get list of files/directories in current directory
-        indx    = host.listdir('.')
-        #files   = []
-        more_to_see_here = False    # Switched if entering a new folder
-
-        print indx
-
-        # For every item in directory
-        for item in indx :
-            print 'Current item:', item
-
-            if host.path.isfile(item) :
-                if item.split(".")[-1] == ftype \
-                and item not in files :
-                    # Is correct data type
-                    # and is not in list of files already
-                    files.append(host.path.abspath(item))
-                    print 'appended', item
-
-            elif host.path.isdir(item) \
-            and host.path.abspath(item) not in has_visited :
-                # The item in the directory is another directory,
-                # and it has not been visited before
-                print host.path.abspath(item), 'not in has_visited'
-                has_visited.append(host.path.abspath(item))
-                host.chdir(item)
-                cntr      += 1
-                dir_level += 1
-                print dir_level
-                
-                # Tell loop that we have entered a new folder
-                more_to_see_here = True
-                print 'Sending break...'
-                break
-
-        if not more_to_see_here :
-            # The loop has run out of folders and files in this directory
-            print 'Loop has run out of folders!'
-            if dir_level != 0 :
-                # Could be dealing with data in root folder
-                # otherwise we move up one directory
-                dir_level -= 1
-                print 'Going up one directory...'
-                host.chdir(host.pardir)
-                print 'Changed to dir:', host.path.abspath(host.getcwd())
-                more_to_see_here = True
-            print dir_level
-
-        if dir_level == 0 and not more_to_see_here :
-            has_visited_all = True
+#
+# File structure:
+#
+# class Experiment
+#   - For an experiment, holding associated files stored as
+#     Child_file objects in a list, Experiment.files
+#
+# class Child_file
+#   - Each file found on the server becomes a Child_file object
+#     where the properties are stored as a dictionary
+#     in Child_file.properties
+#
+# class Upload
+#   - Connects to the CCI-API and gets IDs for experiment names
+#     and uploads files for that experiment ID.
+#   - Note especially post_files()
+#     where the files of Experiment are attempted transferred to the
+#     server, but the server can't accept all the fields for each file yet.
+#
+# class Explore
+#   - Function that accesses the CCI FTP server and enumerates it from a
+#     given folder, see CCI_FTP and CCI_HOME in config.py
+#
 
 
-    # Returns list of path to all data files 
-    # that were in the subfolders of the directory host was in
-    print 'Has visited all?', has_visited_all
-    print 'Reached return, end of function...'
-    return files
 
-def find_info(list_of_files, sqlite_db_connection, experiment_list=None,
-              product_list=None, sensor_list=None):
-    """ Connects to SQLite database and reads through list of files,
-        categorising each item in the file list by assigning:
-            - Experiment (from list)
-            - Date and time
-            - Level
-            - ?
-            - Filename/ftp path
-        Checks database if the data already exist, and adds if not there """
+class Experiment :
+    def __init__(self, name) :
+        """ Collection of files for a CCI experiment.
+            Note that the CCI_* paths define the experiment location
+            and not the name passed to the class
+        """
+        self.name  = name
+        self.files = []
 
-    c = sqlite_db_connection.cursor()
-    entries_to_add = []
-    exp_l = experiment_list \
-            or [\
-            'aerosol',
-            'cloud',
-            'fire',
-            'ghg',
-            'glaciers',
-            'ice_sheets_greenland',
-            'land_cover',
-            'ocean_colour',
-            'ozone',
-            'sea_ice',
-            'sea_level',
-            'soil_moisture',
-            'sst' ]
+        self.has_experiments_list = False
+        self.has_product_list    = False
+        self.has_fname_list      = False
+        self.has_overview_list   = False
 
-    prod_l = product_list \
-            or [\
-            'AATSR_SU',     # aerosol
-            'ATSR2_SU',
-            'MS_UVAI',
-            'L3C',          # cloud
-            'L3U',
-            'burned_area/grid',
-            'burned_area/pixel',
-            'XCH4_GOS_FP',
-            'XCH4_GOS_PR',
-            'XCH4_SCI',
-            'XCO2_EMMA',
-            'XCO2_GOS',
-            'XCO2_SCI',
-            'geographic',   # ocean_colour
-            'sinusoidal',
-            'TC_L3_MRG',    # ozone
-            'MSLA',         # sea_level
-            'ACTIVE',       # soil_moisture
-            'PASSIVE',
-            'COMBINED',
-            'gmpe'          # sst
-            ]
+    def is_in_files(self, fname):
+        """ Checks if file fname is amongst added files
+        """
 
-    sensor_l = sensor_list or \
-            ['AVHRR', 'MODIS', 'AATSR', 'MERISAATSR',
-             'MERIS',
-             'TANSO', 'GOSAT',
-             'SCIAMACHY', 'ENVISAT']
+        if not self.has_fname_list :
+            self.filenames = set()
+            for f in self.files :
+                self.filenames.add(f.fname)
 
-    d_level = ['L1', 'L2', 'L3', 'L4']
-    d_rate  = ['DAILY', 'MONTHLY', 'YEARLY', 'daily', 'monthly', 'yearly']
-    neglect = ['ESACCI', 'neodc', 'data']   # append "noise" here
+            self.has_fname_list = True
 
-    #date    = re.compile("((19|20)(\d{2}))(0[1-9]|1[012])(0[1-9]|[12][0-9]|3[01])")
-    date    = re.compile("((19|20)(\d{2}))(0[1-9]|1[012])(0[1-9]|[12][0-9]|3[01])((\d{2})(\d{2})(\d{2}))?")
+        return (fname in self.filenames)
 
-    for f in list_of_files:
-        print 'Found file', f
-        # check each entry, categorising it and saving it to database
+
+    def create_experiment_list(self):
+        """ Iterate throuch each file and see if there
+            are different experiments present
+        """
+
+        if not self.has_experiments_list :
+            self.experiments = set()
+            for f in self.files :
+                self.experiments.add(f.properties['experiment'])
+
+            self.has_experiments_list = True
+
+        print self.experiments
+
+    def create_product_list(self):
+        """ Iterate throuch each file and see if there
+            are different products present
+        """
+
+        if not self.has_product_list :
+            self.products = set()
+            for f in self.files :
+                self.products.add(f.properties['product'])
+
+            self.has_product_list = True
+
+        print self.products
+
+    def create_overview_list(self):
+        """ Iterate through each file and 
+            generate tuples of experiment, product and description
+        """
+        if not self.has_overview_list:
+            self.overview = set()
+            for f in self.files :
+                self.overview.add((f.properties['experiment'],
+                                   f.properties['product'],
+                                   f.properties['project']))
+
+            self.has_overview_list = True
+
+        print self.overview
+
+
+
+class Child_file :
+    def __init__(self, path,
+                 main_file=None, FTP_PATH=None):
+        """ Child file in an experiment 
+        """
+
+        self.CCI_FTP = FTP_PATH or CCI_FTP
+        self.path = path
+        self.webpath = 'ftp://{0}{1}'.format(CCI_FTP, self.path)
+        self.fname   = self.path.split('/')[-1]
+
+        self.properties = dict()
+
+        if main_file is not None :
+            # Add properties from this file
+            self.properties = main_file.properties
+        else :
+            # Add properties based on file contents
+            print 'Examining ', self.webpath
+            details = exam_cdf(self.webpath)
+            self.properties.update(details)
+
+        # adjust file properties such as date, etc from file name
+        self.find_filename_info()
+
+    def find_filename_info(self):
+        """ Classifies information based on information held in path
+        """
+        # Experiments
+        exp_l = ['aerosol', 'cloud', 'fire', 'ghg', 'glaciers',
+                'ice_sheets_greenland', 'land_cover', 'ocean_colour',
+                'ozone', 'sea_ice', 'sea_level', 'soil_moisture', 'sst' ]
+        # Products
+        prod_l = [\
+                'AATSR_SU',     # aerosol
+                'ATSR2_SU',
+                'MS_UVAI',
+                'L3C',          # cloud
+                'L3U',
+                'burned_area/grid',
+                'burned_area/pixel',
+                'XCH4_GOS_FP',
+                'XCH4_GOS_PR',
+                'XCH4_SCI',
+                'XCO2_EMMA',
+                'XCO2_GOS',
+                'XCO2_SCI',
+                'geographic',   # ocean_colour
+                'sinusoidal',
+                'TC_L3_MRG',    # ozone
+                'MSLA',         # sea_level
+                'ACTIVE',       # soil_moisture
+                'PASSIVE',
+                'COMBINED',
+                'gmpe'          # sst
+                ]
+
+        ## Sensors
+        #sensor_l = ['AVHRR', 'MODIS', 'AATSR', 'MERISAATSR',
+        #         'MERIS',
+        #         'TANSO', 'GOSAT',
+        #         'SCIAMACHY', 'ENVISAT']
+
+        d_level = ['L1', 'L2', 'L3', 'L4']
+        d_rate  = ['DAILY', 'MONTHLY', 'YEARLY',
+                   'daily', 'monthly', 'yearly']
+        neglect = ['ESACCI', 'neodc', 'data']   # append "noise" here
+
+        date    = re.compile("((19|20)(\d{2}))(0[1-9]|1[012])(0[1-9]|[12][0-9]|3[01])((\d{2})(\d{2})(\d{2}))?")
+
+        f = self.path[:]
+        # check each entry
         f_exp = ''  # Dataset
         f_prd = ''  # Product
         f_lvl = ''  # Level
-        f_sns = ''  # Sensor
+        #f_sns = ''  # Sensor
         f_rte = ''  # rate
         f_dte = ''  # date/time
         f_pth = ''  # path
 
         if f.startswith('/neodc/esacci/'):
             # The string makes sense, shorten it
-
-            # Path
-            f_pth = 'ftp://{0}{1}'.format(CCI_FTP, f)
-            print f_pth
 
             # Shorten
             f = f[14:]
@@ -201,7 +217,6 @@ def find_info(list_of_files, sqlite_db_connection, experiment_list=None,
                 f_exp = f_p[0]
             else :
                 print "Not in experiment list, discarding"
-                continue
 
             # Cross-check with the rest
             # Product
@@ -213,9 +228,9 @@ def find_info(list_of_files, sqlite_db_connection, experiment_list=None,
                 if lvl in f :
                     f_lvl = lvl
 
-            for sns in sensor_l :
-                if sns in f :
-                    f_sns = sns
+            #for sns in sensor_l :
+            #    if sns in f :
+            #        f_sns = sns
 
             for rate in d_rate :
                 if rate in f :
@@ -233,167 +248,314 @@ def find_info(list_of_files, sqlite_db_connection, experiment_list=None,
             f_dte   = '{0}-{1}-{2} {3}:{4}:{5}'.format(
                     dte_yr, dte_mn, dte_dy, dte_hr, dte_mi, dte_sc )
 
-            f_siz   = exam_size(f_path)
+            f_siz   = exam_size(self.webpath)
 
-            entries_to_add.append((
-                f_exp, 
-                f_prd, 
-                f_lvl, 
-                f_sns, 
-                f_rte, 
-                f_dte, 
-                f_siz,
-                f_pth))
+            # Save to file properties
+            outs  = [ f_exp,  f_prd,  f_lvl,  f_rte,
+                      f_dte,  f_siz,  f_pth ]
+
+            props = ['experiment', 'product', 'level', 'rate',
+                     'date', 'size']
+
+            for out, prop in zip(outs, props):
+                self.properties[prop] = out
 
         else :
             # Something is not right
             print "Path to NetCDF file makes no sense, printing it:"
             print f
 
-    print 'Execute many, adds to database'
-    print len(entries_to_add)
 
-    c.executemany('INSERT INTO {0} VALUES (?,?,?,?,?,?,?)'.format(\
-            CCI_DB_NAME), 
-            entries_to_add)
 
-    sqlite_db_connection.commit()
-    
+class Upload :
+    def __init__(self, experiment, server_url=None):
+        """ Uploads an experiment to the CCI-DB using
+            the API
+        """
+        self.experiment = experiment
+        self.server_url = server_url
 
-def connect_sqlite_db(sqlite_db_file):
-    """ Returns connection to SQLite database file,
-        creates database file if it does not exist. """
+        self.has_prepared_out = False
 
-    if os.path.exists(sqlite_db_file) :
-        conn = sqlite3.connect(sqlite_db_file)
-    else :
-        # Create it
-        conn = sqlite3.connect(sqlite_db_file)
+        print self.experiment.files[0].properties.keys()
 
-        # Create required fields
+        if self.server_url is None :
+            raise IOError('server_url is not defined')
+
+    def prepare_experiment(self):
+        """ Iterates through the files and gathers:
+            - Experiments
+            - Products
+            - Filenames
+        """
         
-        print "Creating DB fields"
-        c = conn.cursor()
-        c.execute('CREATE TABLE {2} ({3} {0}, {4} {0}, {5} {0}, {6} {0}, {7} {0}, {8} {0}, {9} {0})'.format( \
-                  'TEXT', 'INTEGER',
-                  'cci_db', 
-                  'dataset', 'product', 'level', 'sensor', 'rate', 'datetime', 'path'))
+        if not self.has_prepared_out:
+            self.experiment.create_overview_list()
+        
+        self.has_prepared_out = True
 
-        conn.commit()
+    def get_experiment(self):
+        """ Get full overview of experiments from server
+        """
+        if not self.has_prepared_out:
+            self.prepare_experiment()
 
-    return conn
+        # The experiments have been assigned IDs that
+        # need to be resolved to experiment names
 
-def exam_size(filein):
-    """ Exams size of NetCDF file.
-        Input: FTP address (string)
-        Returns FILESIZE in bytes """
+        resp = requests.get(self.server_url + 'experiments/')
+        self.experiment.id_names_desc = json.loads(resp.content)
 
-    c = pycurl.Curl()
-    c.setopt(c.URL, filein)
-    c.setopt(c.HEADER, 1)
-    c.setopt(c.NOBODY, 1)
-    c.perform()
-    filesize = c.getinfo(c.CONTENT_LENGTH_DOWNLOAD)
+        self.ids_are_known = True
 
-    return filesize
+    def post_experiment(self):
+        """ POST new experiment to server 
+        """
+        if not self.has_prepared_out:
+            self.prepare_experiment()
 
-def exam_cdf(filein, dllist=None, errorlog=None):
-    """ Opens and exams NetCDF file. 
-        Input:  filein: ftp address of file
-                dllist: dictionary of downloaded ftp files and location,
-                        where each key is a ftp address
-        Returns header values:
-            - Geospatial latitude:  max, min(, resolution)
-            - Geospatial longitude: max, min(, resolution)
-            - (Geospatial resolution if not already found for lat/long)
-            - Geospatial: max, min
-            - ...
-    """
+        for exp, prod, desc in self.experiment.overview:
+            print exp, prod, desc
+            dt = json.dumps(\
+                    {'name': exp,
+                     'desc': desc})
+            resp = requests.post(
+                    self.server_url + 'experiments/',
+                    data=dt,
+                    headers={'Content-type':'application/json'})
+            print resp
 
-    # Check if file has been downloaded
-    file_downloaded = False
-    if dllist :
-        if filein in dllist.keys():
-            file_downloaded = True
-            dlfile = dllist[filein]
+    def post_files(self):
+        """ POST files to server.
+            Server expects:
+                - start_date
+                - end_date
+                - product_ids
+                - experiment_ids
+            Available: 
+                - experiment
+                - product
+                - level
+                - rate (update rate: hourly, daily, monthly, yearly)
+                - date (for observation start)
+                - size (file size)
+                - path
+                - webpath
+                - filename
+                - geospatial_lat_min
+                - geospatial_lat_max
+                - geospatial_lon_min
+                - geospatial_lon_max
+                - geospatial_vertical_min
+                - geospatial_vertical_max
+                - geospatial_lat_units
+                - geospatial_resolution
+                - geospatial_lat_resolution
+                - geospatial_lon_resolution
+                - spatial_resolution
+                - time_coverage_resolution
+                - sensor
+                - platform
+                - keywords
+                - project
+            obtained from NetCDF files and file paths.
+        """
 
-    if not file_downloaded :
-        # Download file to a temp D/L directory 
-        pid = os.getpid()
-        dlfolder0 = 'temp_dl/'
-        dlfolder1 = 'temp_dl/' + str(pid) + '/'
-        dlfile   = dlfolder1 + filein.split('/')[-1]
-        if not os.path.isdir(dlfolder0):
-            os.mkdir(dlfolder0)
-            os.mkdir(dlfolder1)
+        if not self.has_prepared_out:
+            self.prepare_experiment()
+        if not self.ids_are_known:
+            self.get_experiment()
+
+
+        for f in self.experiment.files:
+            # Get experiment and product and resolve these 
+            # to the CCI-API given ids
+
+            my_exp  = f.properties['experiment']
+            my_prod = f.properties['product']
+
+            for v in self.experiment.id_names_desc['experiments']:
+                if v['name'] == my_exp:
+                    my_id   = v['id']
+                    break
+
+            print my_id
+                    
+            dt =    {'experiment_ids': my_id,
+                     'webpath': f.webpath }
+            for key in f.properties.keys():
+                dt[key] = f.properties[key]
+
+            dt = json.dumps(dt)
+            print dt
+
+            resp = requests.post(
+                    self.server_url + 'files/',
+                    data=dt,
+                    headers={'Content-type':'application/json'})
+            print resp
+
+
+        for exp, prod, desc in self.experiment.overview:
+            print exp, prod, desc
+            dt = json.dumps(\
+                    {'name': exp,
+                     'desc': desc})
+            resp = requests.post(
+                    self.server_url + 'experiments/',
+                    data=dt,
+                    headers={'Content-type':'application/json'})
+            print resp
+
+
+
+
+
+class Explore :  
+    def __init__(self, experiment, ftype=None):
+        """ Iterates through each file in the folders for a given 
+            Experiment.
+            Note that the CCI_* paths define the experiment location
+            and not the name passed to Experiment
+        """
+        
+        self.experiment = experiment        # experiment of class Experiment
+
+        self.has_visited_all = False
+        self.first_file      = True
+        self.more_to_see_here = False       # True when entering folder
+        self.current_level = 0
+        self.visited_folders = set()
+        self.visited_files  = set()
+        self.ftype          = ftype or CCI_DTYPE
+
+
+    def connect_server(self, url=None, user=None, passw=None, homedir=None):
+        """ Connects to FTP server
+            and changes to working directory specified by homedir 
+        """
+
+        url     = url or CCI_FTP
+        user    = user or CCI_USER
+        passw   = passw or CCI_PASS
+        homedir = homedir or CCI_HOME
+
+        self.host = ftputil.FTPHost(url, user, passw)
+        self.host.chdir(homedir)
+        print self.host.listdir('.')
+
+
+    def new_file(self, webpath, shortpath, has_mother_file=None):
+        """ Add this file to the experiment """
+        self.experiment.files.append(\
+                Child_file(webpath, has_mother_file))
+        self.visited_files.add(shortpath)
+
+
+    def add_files(self):
+        """ Traverse CCI folders and add files to experiment """
+
+        while not self.has_visited_all :
+            # Loops as long as there are unexplored files/dirs
+
+            items = self.index_folder()
+
+            for item in items:
+                print item
+
+                if self.check_if_file(item) :
+                    # The item is a file
+                    abs_path = self.host.path.abspath(item)
+
+                    if self.first_file :
+                        # First file in folder is downloaded and
+                        # will be used to give common properties
+                        # to the other files in the folder
+                        the_mother_file = \
+                                Child_file(abs_path)
+
+                        self.first_file = False
+
+                    # add file in folder with index idx
+                    self.new_file(abs_path, item, the_mother_file)
+
+                elif self.check_if_folder_and_not_visited(item) :
+                    # An unexplored folder
+                    self.go_down(item)
+
+                    # Break item loop so that the new folder is explored
+                    break
+
+                else :
+                    # All items in items have been checked
+                    self.more_to_see_here = False
+
+            if not self.more_to_see_here :
+                # The loop has run out of folders and files in this dir
+                print 'Loop has run out of folders!'
+
+                if self.current_level != 0 :
+                    # Return to parent dir to see if more files exist
+                    self.go_up()
+
+                print self.current_level
+
+            if self.current_level == 0 and not self.more_to_see_here :
+                # Has returned to top level and no folders remain
+                self.has_visited_all = True
+
+
+    def index_folder(self):
+        """ Retrieves list of objects in FTP folder
+        """
+        indx    = self.host.listdir('.')
+        return indx
+
+    def go_down(self, item):
+        """ Enters item on FTP server
+        """
+        print "Going down", item
+        self.current_level += 1
+        self.more_to_see_here = True
+        self.first_file = True
+
+        self.visited_folders.add(self.host.path.abspath(item))
+
+        self.host.chdir(item)
+
+    def go_up(self):
+        """ Returns to parent directory on FTP server
+        """
+        print "Going up"
+        self.current_level -= 1
+        self.first_file = True
+        self.more_to_see_here = True 
+
+        self.host.chdir(self.host.pardir)
+
+    def check_if_file(self, item):
+        """ Checks if item is a file
+            and that it has not been checked before
+        """
+        if self.host.path.isfile(item) :
+            if item.split(".")[-1] == self.ftype \
+            and item not in self.visited_files :
+                return True
+            else :
+                return False
+
+    def check_if_folder_and_not_visited(self, item):
+        """ Checks if item is a directory
+            and that it has not been checked before
+        """
+        if self.host.path.isdir(item) \
+        and self.host.path.abspath(item) not in self.visited_folders:
+            # The item in the directory is another directory,
+            # and it has not been visited before
+            print self.host.path.abspath(item), 'not in has_visited'
+            return True
         else :
-            if not os.path.isdir(dlfolder1):
-                os.mkdir(dlfolder1)
-
-        print 'Downloading', filein
-        print exam_size(filein)/1024/1024, 'mb to download'
-        with open(dlfile, 'wb') as d:
-            c = pycurl.Curl()
-            c.setopt(c.URL, filein)
-            c.setopt(c.WRITEDATA, d)
-            c.perform()
-        print 'Download of', filein, 'completed'
-
-        # Check if the file was downloaded
-        if not (os.path.isfile(dlfile) and os.path.getsize(dlfile) > 0) :
-            raise IOError('Downloaded file {} does not exist/is empty!' \
-                    .format(dlfile))
-
-        if dllist :
-            # Append downloaded file to dictionary
-            dllist[filein] = os.path.abspath(dlfile)
-
-
-    # Investigate file
-    df = Dataset(dlfile, 'r')
-
-    outs = dict()
-
-    # Lat/longs
-    args = ['geospatial_lat_min', 'geospatial_lat_max', 
-            'geospatial_lon_min', 'geospatial_lat_max', 
-            'geospatial_vertical_min', 'geospatial_vertical_max', 
-            'geospatial_lat_units',
-            'geospatial_lat_resolution', 'geospatial_lon_resolution', 
-            'spatial_resolution', 'time_coverage_resolution', 
-            'sensor', 'platform', 'keywords']
-    for a in args:
-        try :
-            outs[a] = getattr(df, a)
-        except AttributeError :
-            outs[a] = ''
-
-
-    return outs
-
-
-
-def test_functions():
-    """ Test functions """
-    print "CONNECT_SQLITE_DB"
-    sq_c = connect_sqlite_db("test_db.sql")
-    c = sq_c.cursor()
-    test_entry = [('aerosol', 'AATSR_SU', 'L2', '', 'DAILY', '2002-10-12 12:22:35', '/cci/p')]
-    c.executemany('INSERT INTO cci_db VALUES (?,?,?,?,?,?,?)', test_entry)
-    sq_c.commit()
-
-    print "FIND_INFO"
-    if os.path.exists(CCI_LS_PATH):
-        print 'CCI dictionary exists, loads into memory'
-        with open(CCI_LS_PATH, 'r') as cci_db_file:
-            cci_db = json.load(cci_db_file)
-            print 'CCI dictionary loaded as "cci_db"'
-        find_info(cci_db['11']['all_files'], sq_c)
-    else :
-        find_info(["aerosol/data/AATSR_SU/L3_DAILY/v4.2/2002/11/20021126-ESACCI-L3C_AEROSOL-ALL-AATSR_ENVISAT-SU_DAILY-v4.2.nc", "/neodc/esacci/aerosol/data/AATSR_SU/L3_DAILY/v4.2/2002/11/20021126-ESACCI-L3C_AEROSOL-ALL-AATSR_ENVISAT-SU_DAILY-v4.2.nc"], sq_c)
-
-
-    
+            return False
 
 
     
@@ -401,54 +563,37 @@ def test_functions():
 
 if __name__ == '__main__':
 
-    # Step 1:   Check if data dictionary already exists,
-    #           else get overview of data from CCI server
-    if os.path.exists(CCI_LS_PATH):
-        print 'CCI dictionary exists, loads into memory'
-        with open(CCI_LS_PATH, 'r') as cci_db_file:
-            cci_db = json.load(cci_db_file)
-            print 'CCI dictionary loaded as "cci_db"'
+    # Dumps pickled Experiment to file holding list of files
+    tmp_dump = 'dump_exp.pickle'
+
+    if not os.path.isfile(tmp_dump):
+
+        # Set up new experiment to hold list of files
+        exp = Experiment('test experiment')
+
+        # Iterate through FTP server
+        ex1 = Explore(exp)
+        ex1.connect_server()
+        ex1.add_files()
+
+        with open(tmp_dump, 'w') as f:
+            pickle.dump(exp, f)
     else :
-        print 'CCI dictionary not found, will scan FTP server'
-        import ftputil
-
-        # Init empty dict
-        cci_db = {}
+        with open(tmp_dump, 'r') as f:
+            exp = pickle.load(f)
         
-        # Connect to host:
-        with ftputil.FTPHost(CCI_FTP, CCI_USER, CCI_PASS) as host :
-            host.chdir(CCI_HOME)
 
-            # Iterate through each folder on server and
-            # create list of data files available for each 
-            # data set. 
-            cci_dataset = host.path.basename(host.getcwd())
-            print 'Connected to host. Current folder:', cci_dataset
-            dfiles = find_all_datafiles(host, CCI_DTYPE)
-            cci_db[cci_dataset] = dfiles
+    # Upload to the CCI-API database
+    ul  = Upload(exp, server_url=CCI_API_URL)
+    ul.post_experiment()
+    ul.get_experiment()
+    ul.post_files()
 
-        print 'Done saving list of CCI data into dict cci_db'
-        print 'Saving to file:', CCI_LS_PATH
-        with open(CCI_LS_PATH, 'w') as cci_db_file :
-            json.dump(cci_db, cci_db_file)
-            print 'Saved.'
-
-    ## Step 2:
-    ## Analyse and categorise the data
-    ## Appends or establishes a SQLite database
-
-    print "CONNECT_SQLITE_DB"
-    cci_sql = connect_sqlite_db(CCI_DB_PATH)
-    c       = cci_sql.cursor()
-
-    print "FIND_INFO", 'Categorises data from dictionary'
-    print "Iterates through each key"
-    for key in cci_db:
-        print 'Current key:', key
-        find_info(cci_db[key], cci_sql)
-
-
-
+    # Tests on the experiment class
+    exp.create_experiment_list()
+    exp.create_product_list()
+    exp.create_overview_list()
+    print exp.is_in_files('20061207-ESACCI-L4_FIRE-BA-MERIS-fv03.1.nc')
 
 
 
