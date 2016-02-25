@@ -48,6 +48,19 @@ class Experiment :
         self.has_product_list    = False
         self.has_fname_list      = False
         self.has_overview_list   = False
+        self.has_file_size       = False
+
+        self.N  = len(self.files)
+
+    def summary(self):
+        """ Prints summary of the data that has been added to this 
+            experiment.
+        """
+
+        self.create_file_size()
+
+        print "Number of files:", self.N
+        print "Total file size:", self.file_size
 
     def is_in_files(self, fname):
         """ Checks if file fname is amongst added files
@@ -105,6 +118,20 @@ class Experiment :
             self.has_overview_list = True
 
         print self.overview
+
+    def create_file_size(self):
+        """ Iterates over every file and adds up to the total file size
+        """
+
+        if not self.has_file_size:
+            self.total_file_size = 0
+            for f in self.files :
+                self.total_file_size += f.properties['size']
+
+            self.has_file_size = True
+
+        return self.total_file_size
+
 
 
 
